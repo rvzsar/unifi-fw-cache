@@ -6,6 +6,8 @@ set -euo pipefail
 # --- Конфигурация по умолчанию ---
 UNIFI_FW_DIR="${UNIFI_FW_DIR:-/var/lib/unifi/firmware}"
 CATALOG="${CATALOG:-/var/lib/unifi/firmware.json}"
+# ВНИМАНИЕ: Прямой URL недоступен (403 Forbidden). Используйте --fetch-catalog-api
+CATALOG_URL="${CATALOG_URL:-https://fw-download.ubnt.com/data/firmware.json}"
 APP_VERSION="${APP_VERSION:-}"
 DEV_FAMILY="${DEV_FAMILY:-}"
 VERSION="${VERSION:-}"
@@ -13,12 +15,18 @@ UNIFI_USER="${UNIFI_USER:-unifi}"
 UNIFI_GROUP="${UNIFI_GROUP:-unifi}"
 RESTART="${RESTART:-1}"
 REWRITE_HOST="${REWRITE_HOST:-}"
+REWRITE_CATALOG_HOST="${REWRITE_CATALOG_HOST:-}"
 MIRROR_ROOT="${MIRROR_ROOT:-.}"
 DOWNLOAD_THREADS="${DOWNLOAD_THREADS:-5}"
+MAX_CATALOG_AGE="${MAX_CATALOG_AGE:-20}"
+CATALOG_BACKUP="${CATALOG_BACKUP:-1}"
 
 SRC_DIR=""
 FROM_CATALOG=0
 MIRROR_ALL=0
+UPDATE_CATALOG=0
+AUTO_UPDATE_CATALOG=0
+FETCH_CATALOG_API=0
 CODES=()
 EXTRA_SOURCES=()
 SRC_URL_PAIRS=()
@@ -40,18 +48,94 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [OPTIONS] [URL_or_FILE ...]
 
-Режим контроллера:
-  --from-catalog           кэшировать прошивки в /var/lib/unifi/firmware
-  --filter "REGEX"         фильтр (напр. "^(UAP|US)" для AP и Switch)
-  --codes "CODES"          список кодов вручную ("U7PG2 UAP6MP")
-  
-Режим зеркала:
-  --mirror-all             создать зеркало файлов
-  --mirror-root PATH       путь для зеркала (напр. /root/unifi-cache)
+🎮 Режим контроллера:
+  --from-catalog              Кэшировать прошивки из firmware.json
+  --filter "REGEX"            Фильтр устройств (напр. "^(UAP|US)" для AP и Switch)
+  --codes "CODES"             Список кодов устройств ("U7PG2 UAP6MP UAL6")
+  --catalog PATH              Путь к firmware.json (default: /var/lib/unifi/firmware.json)
+  --app-version VERSION       Версия контроллера (default: auto)
 
-Опции:
-  --threads N              потоков (default: 5)
-  --no-restart             не перезапускать unifi
+🌐 Режим зеркала:
+  --mirror-all                Создать полное зеркало прошивок
+  --mirror-root PATH          Корневая директория зеркала (default: .)
+  --rewrite-host HOST         Заменить хост при скачивании (для прокси/зеркала)
+
+📋 Обновление каталога:
+  --update-catalog            Обновить firmware.json и выйти
+  --auto-update-catalog       Автообновление каталога при запуске (если устарел)
+  --fetch-catalog-api         Получить каталог через API Ubiquiti вместо прямого URL
+                              (рекомендуется для --mirror-all, т.к. прямой URL недоступен)
+  --catalog-url URL           URL источника каталога (может быть недоступен: 403 Forbidden)
+                              (default: https://fw-download.ubnt.com/data/firmware.json)
+  --rewrite-catalog-host HOST Заменить хост в URL каталога (напр. fw-mirror.example.com)
+  --max-catalog-age DAYS      Максимальный возраст каталога в днях (default: 20)
+  --no-catalog-backup         Не создавать резервную копию при обновлении
+
+🔧 Дополнительные опции:
+  --src-dir PATH              Директория с локальными файлами прошивок
+  --src-url URL [FILE]        Сопоставить URL с локальным файлом
+  --threads N                 Количество параллельных загрузок (default: 5)
+  --no-restart                Не перезапускать службу unifi
+  --dev-family CODE           Принудительно указать семейство устройства
+  --version VERSION           Принудительно указать версию прошивки
+  -h, --help                  Показать эту справку
+
+📝 Переменные окружения:
+  UNIFI_FW_DIR                Директория кэша (default: /var/lib/unifi/firmware)
+  CATALOG                     Путь к firmware.json (default: /var/lib/unifi/firmware.json)
+  CATALOG_URL                 URL источника каталога
+  APP_VERSION                 Версия контроллера (default: auto)
+  UNIFI_USER                  Владелец файлов (default: unifi)
+  UNIFI_GROUP                 Группа файлов (default: unifi)
+  RESTART                     Перезапускать unifi (1/0, default: 1)
+  REWRITE_HOST                Заменить хост при загрузке прошивок
+  REWRITE_CATALOG_HOST        Заменить хост в каталоге
+  MIRROR_ROOT                 Корень зеркала (default: .)
+  DOWNLOAD_THREADS            Количество потоков (default: 5)
+  MAX_CATALOG_AGE             Максимальный возраст каталога в днях (default: 20)
+  CATALOG_BACKUP              Делать резервные копии (1/0, default: 1)
+
+💡 Примеры использования:
+
+  # Кэшировать прошивки для конкретных устройств
+  sudo ./$(basename "$0") --from-catalog --codes "UAP6MP U7PG2 UAL6"
+
+  # Скачать прошивку по прямому URL (автоопределение совместимых устройств)
+  sudo ./$(basename "$0") https://dl.ui.com/unifi/firmware/U7PG2/6.7.35.15586/file.bin
+
+  # Несколько прошивок за раз
+  sudo ./$(basename "$0") url1.bin url2.bin url3.bin --threads 10
+
+  # Обновить firmware.json с переписыванием хостов
+  sudo ./$(basename "$0") --update-catalog \\
+    --catalog-url https://fw-mirror.example.com/firmware.json \\
+    --rewrite-catalog-host fw-mirror.example.com
+
+  # Автообновление каталога при скачивании прошивок
+  sudo ./$(basename "$0") --auto-update-catalog --from-catalog --codes "U7PG2"
+
+  # Создать зеркало через API Ubiquiti (рекомендуется)
+  ./$(basename "$0") --fetch-catalog-api \\
+    --rewrite-catalog-host fw-mirror.example.com \\
+    --mirror-all --mirror-root /srv/unifi-mirror
+
+  # Создать зеркало с кастомного зеркала (если есть свой mirror с firmware.json)
+  ./$(basename "$0") --update-catalog \\
+    --catalog-url https://your-internal-mirror.local/firmware.json \\
+    --rewrite-catalog-host your-internal-mirror.local \\
+    --mirror-all --mirror-root /srv/unifi-mirror
+
+  # Добавить локальные файлы в кэш
+  sudo ./$(basename "$0") --src-dir /path/to/firmware-files/
+
+  # Использовать внутреннее зеркало
+  REWRITE_HOST=mirror.local sudo -E ./$(basename "$0") --from-catalog --codes "UAP6MP"
+
+📚 Документация:
+  README.md           - Основная документация
+  CATALOG_UPDATE.md   - Руководство по обновлению каталога
+
+🔗 Подробнее: https://github.com/nimbo78/unifi-fw-cache
 EOF
 }
 
@@ -83,10 +167,17 @@ while [[ $# -gt 0 ]]; do
     --mirror-all) MIRROR_ALL=1; shift ;;
     --mirror-root) shift; MIRROR_ROOT="${1:-$MIRROR_ROOT}"; shift || true ;;
     --rewrite-host) shift; REWRITE_HOST="${1:-}"; shift || true ;;
+    --rewrite-catalog-host) shift; REWRITE_CATALOG_HOST="${1:-}"; shift || true ;;
     --dev-family) shift; DEV_FAMILY="${1:-}"; shift || true ;;
     --version) shift; VERSION="${1:-}"; shift || true ;;
     --threads) shift; DOWNLOAD_THREADS="${1:-5}"; shift || true ;;
     --no-restart) RESTART=0; shift ;;
+    --update-catalog) UPDATE_CATALOG=1; shift ;;
+    --auto-update-catalog) AUTO_UPDATE_CATALOG=1; shift ;;
+    --fetch-catalog-api) FETCH_CATALOG_API=1; shift ;;
+    --catalog-url) shift; CATALOG_URL="${1:-$CATALOG_URL}"; shift || true ;;
+    --max-catalog-age) shift; MAX_CATALOG_AGE="${1:-20}"; shift || true ;;
+    --no-catalog-backup) CATALOG_BACKUP=0; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) echo "Unknown: $1" >&2; usage; exit 2 ;;
@@ -120,6 +211,231 @@ install_file() {
   ensure_dir "$(dirname "$dst")"
   if [[ $NEED_CONTROLLER -eq 1 ]]; then install -o "$UNIFI_USER" -g "$UNIFI_GROUP" -m "$mode" "$src" "$dst"
   else cp "$src" "$dst" && chmod "$mode" "$dst"; fi
+}
+
+check_catalog_age() {
+  local catalog="$1"
+  local max_age="${2:-20}"
+
+  [[ ! -f "$catalog" ]] && return 1
+
+  local file_age_days=$(( ($(date +%s) - $(stat -c%Y "$catalog")) / 86400 ))
+
+  if [[ $file_age_days -gt $max_age ]]; then
+    echo "⚠️ Каталог устарел: $file_age_days дней (лимит: $max_age дней)"
+    return 1
+  fi
+
+  echo "✅ Каталог актуален: $file_age_days дней"
+  return 0
+}
+
+normalize_host() {
+  local host="$1"
+
+  # Убрать trailing slash если есть
+  host="${host%/}"
+
+  # Если уже есть протокол, вернуть как есть
+  if [[ "$host" =~ ^https?:// ]]; then
+    echo "$host"
+    return
+  fi
+
+  # Иначе добавить https://
+  echo "https://$host"
+}
+
+rewrite_catalog_hosts() {
+  local catalog="$1"
+  local new_host="$2"
+
+  # Нормализовать хост (добавить https:// если нужно)
+  new_host=$(normalize_host "$new_host")
+
+  local tmp_catalog; tmp_catalog="$(mktemp)"
+
+  echo "🔄 Переписывание хостов на: $new_host"
+
+  # Заменить хост во всех URL, сохраняя весь путь
+  jq --arg host "$new_host" '
+    walk(
+      if type == "object" and has("url") then
+        .url |= sub("^https?://[^/]+"; $host)
+      else . end
+    )
+  ' "$catalog" > "$tmp_catalog" 2>/dev/null
+
+  # Проверить валидность и размер
+  if [[ ! -s "$tmp_catalog" ]]; then
+    echo "⚠️ walk() не сработала, используем альтернативный метод..." >&2
+    # Альтернативный метод: используем sed для простой замены хоста
+    local old_host_pattern="https://fw-download\.ubnt\.com"
+    sed "s|$old_host_pattern|$new_host|g" "$catalog" > "$tmp_catalog"
+
+    if [[ ! -s "$tmp_catalog" ]] || ! jq empty "$tmp_catalog" 2>/dev/null; then
+      echo "❌ Ошибка при переписывании хостов" >&2
+      rm -f "$tmp_catalog"
+      return 1
+    fi
+  fi
+
+  if jq empty "$tmp_catalog" 2>/dev/null; then
+    mv "$tmp_catalog" "$catalog"
+    echo "✅ Хосты переписаны"
+    return 0
+  else
+    echo "❌ Ошибка при переписывании хостов: невалидный JSON" >&2
+    rm -f "$tmp_catalog"
+    return 1
+  fi
+}
+
+update_catalog() {
+  local source_url="${1:-$CATALOG_URL}"
+  local target_file="${2:-$CATALOG}"
+  local rewrite_host="${3:-$REWRITE_CATALOG_HOST}"
+  local backup="${4:-$CATALOG_BACKUP}"
+
+  echo "📥 Обновление каталога из: $source_url"
+
+  # Резервная копия
+  if [[ $backup -eq 1 && -f "$target_file" ]]; then
+    local backup_file="${target_file}.bak.$(ts)"
+    cp "$target_file" "$backup_file" 2>/dev/null || true
+    echo "💾 Резервная копия: $backup_file"
+  fi
+
+  # Скачать новый каталог
+  local tmp_file; tmp_file="$(mktemp)"
+  if ! wget -q -O "$tmp_file" "$source_url" 2>/dev/null; then
+    echo "❌ Ошибка загрузки каталога, используется старый"
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  # Проверить валидность JSON
+  if ! jq empty "$tmp_file" 2>/dev/null; then
+    echo "❌ Невалидный JSON, используется старый каталог"
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  # Переписать хосты, если нужно
+  if [[ -n "$rewrite_host" ]]; then
+    if ! rewrite_catalog_hosts "$tmp_file" "$rewrite_host"; then
+      rm -f "$tmp_file"
+      return 1
+    fi
+  fi
+
+  # Заменить старый каталог
+  ensure_dir "$(dirname "$target_file")"
+  if [[ $NEED_CONTROLLER -eq 1 || $UPDATE_CATALOG -eq 1 ]]; then
+    # Для режима контроллера или явного обновления - правильные права
+    if is_root; then
+      install -o "$UNIFI_USER" -g "$UNIFI_GROUP" -m 0644 "$tmp_file" "$target_file" 2>/dev/null || cp "$tmp_file" "$target_file"
+    else
+      cp "$tmp_file" "$target_file"
+    fi
+  else
+    cp "$tmp_file" "$target_file"
+  fi
+  rm -f "$tmp_file"
+
+  echo "✅ Каталог обновлён: $target_file"
+  return 0
+}
+
+fetch_and_convert_firmware_api() {
+  local target_file="${1:-firmware.json}"
+  local rewrite_host="${2:-}"
+
+  local api_url="https://fw-update.ubnt.com/api/firmware-latest"
+  local filters="filter=eq~~product~~unifi-firmware&filter=eq~~channel~~release&limit=5000"
+
+  echo "📡 Загрузка каталога через API Ubiquiti..."
+  echo "   Источник: $api_url?$filters"
+
+  # Скачать JSON с API
+  local tmp_api; tmp_api="$(mktemp)"
+  if ! wget -q -O "$tmp_api" "$api_url?$filters" 2>/dev/null; then
+    echo "❌ Ошибка загрузки API" >&2
+    rm -f "$tmp_api"
+    return 1
+  fi
+
+  # Проверить валидность JSON
+  if ! jq empty "$tmp_api" 2>/dev/null; then
+    echo "❌ Невалидный JSON от API" >&2
+    rm -f "$tmp_api"
+    return 1
+  fi
+
+  # Преобразовать формат API в формат firmware.json
+  local tmp_catalog; tmp_catalog="$(mktemp)"
+  echo "🔄 Преобразование формата API в firmware.json..."
+
+  # Извлечь количество устройств
+  local count; count=$(jq '._embedded.firmware | length' "$tmp_api" 2>/dev/null || echo 0)
+  echo "   Найдено устройств: $count"
+
+  # Преобразовать: создаём структуру {"mirror": {"release": {...}}}
+  jq '
+    {
+      "mirror": {
+        "release": (
+          ._embedded.firmware |
+          map({
+            (.platform): {
+              url: ._links.data.href,
+              md5sum: .md5,
+              version: .version,
+              size: .file_size
+            }
+          }) |
+          add
+        )
+      }
+    }
+  ' "$tmp_api" > "$tmp_catalog" 2>/dev/null
+
+  if ! jq empty "$tmp_catalog" 2>/dev/null; then
+    echo "❌ Ошибка преобразования формата" >&2
+    rm -f "$tmp_api" "$tmp_catalog"
+    return 1
+  fi
+
+  rm -f "$tmp_api"
+
+  # Определить путь к файлу с оригинальными ссылками
+  local target_dir; target_dir="$(dirname "$target_file")"
+  local ubnt_catalog="$target_dir/firmware.ubnt.json"
+
+  # Сохранить каталог с оригинальными ссылками Ubiquiti
+  ensure_dir "$target_dir"
+  cp "$tmp_catalog" "$ubnt_catalog"
+  echo "💾 Каталог с оригинальными ссылками: $ubnt_catalog"
+
+  # Если нужно переписать хосты - создаём отдельный файл
+  if [[ -n "$rewrite_host" ]]; then
+    if ! rewrite_catalog_hosts "$tmp_catalog" "$rewrite_host"; then
+      rm -f "$tmp_catalog"
+      return 1
+    fi
+    cp "$tmp_catalog" "$target_file"
+    echo "✅ Каталог с переписанными хостами: $target_file"
+    echo "   Для скачивания используйте: $ubnt_catalog"
+  else
+    # Без переписывания - просто копируем
+    cp "$tmp_catalog" "$target_file"
+    echo "✅ Каталог создан: $target_file"
+  fi
+
+  rm -f "$tmp_catalog"
+
+  echo "   Версия для APP_VERSION: mirror"
+  return 0
 }
 
 find_compatible_devices() {
@@ -314,11 +630,67 @@ process_from_catalog() {
 }
 
 mirror_all() {
-  [[ -r "$CATALOG" ]] || { echo "Каталог не найден" >&2; exit 1; }
-  auto_detect_app_version
   local root="$MIRROR_ROOT"
-  
-  local jq_filter='.[$v].release | .[].url + "\t" + .[].md5sum'
+  local mirror_catalog="$root/firmware.json"
+
+  # Если нужно обновить/получить каталог
+  if [[ $UPDATE_CATALOG -eq 1 || $FETCH_CATALOG_API -eq 1 ]]; then
+    if [[ $FETCH_CATALOG_API -eq 1 ]]; then
+      echo "📦 Получение каталога через API Ubiquiti..."
+      fetch_and_convert_firmware_api "$mirror_catalog" "$REWRITE_CATALOG_HOST"
+      APP_VERSION="mirror"
+    else
+      echo "📦 Обновление каталога для зеркала..."
+      update_catalog "$CATALOG_URL" "$mirror_catalog" "$REWRITE_CATALOG_HOST" "$CATALOG_BACKUP"
+    fi
+  fi
+
+  # Для зеркала приоритетно используем каталог из целевой папки зеркала
+  if [[ -r "$mirror_catalog" ]]; then
+    echo "📋 Используется каталог из зеркала: $mirror_catalog"
+    CATALOG="$mirror_catalog"
+  elif [[ -r "$CATALOG" ]]; then
+    echo "📋 Используется системный каталог: $CATALOG"
+  else
+    echo "⚠️ Каталог не найден ни в зеркале ($mirror_catalog), ни в системе ($CATALOG)" >&2
+    if [[ $FETCH_CATALOG_API -eq 1 ]]; then
+      echo "🔄 Автоматическое получение каталога через API Ubiquiti..." >&2
+      if fetch_and_convert_firmware_api "$mirror_catalog" "$REWRITE_CATALOG_HOST"; then
+        echo "✅ Каталог успешно получен через API: $mirror_catalog"
+        CATALOG="$mirror_catalog"
+        APP_VERSION="mirror"
+      else
+        echo "❌ Не удалось получить каталог через API" >&2
+        exit 1
+      fi
+    else
+      echo "🔄 Автоматическая загрузка каталога с $CATALOG_URL..." >&2
+      echo "⚠️ ВНИМАНИЕ: URL $CATALOG_URL может быть недоступен (403 Forbidden)" >&2
+      echo "💡 Подсказка: используйте --fetch-catalog-api для получения через API Ubiquiti" >&2
+      if update_catalog "$CATALOG_URL" "$mirror_catalog" "$REWRITE_CATALOG_HOST" "0"; then
+        echo "✅ Каталог успешно загружен: $mirror_catalog"
+        CATALOG="$mirror_catalog"
+      else
+        echo "❌ Не удалось загрузить каталог" >&2
+        echo "💡 Попробуйте с флагом --fetch-catalog-api" >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  auto_detect_app_version
+
+  # Определить каталог для скачивания (с оригинальными ссылками)
+  local ubnt_catalog="$root/firmware.ubnt.json"
+  local download_catalog="$CATALOG"
+  if [[ -r "$ubnt_catalog" ]]; then
+    download_catalog="$ubnt_catalog"
+    echo "⬇️ Скачивание по оригинальным ссылкам: $ubnt_catalog"
+  else
+    echo "⬇️ Скачивание по каталогу: $download_catalog"
+  fi
+
+  local jq_filter='.[$v].release | to_entries[] | .value.url + "\t" + .value.md5sum'
   if [[ -n "$FILTER_REGEX" ]]; then
       echo "Зеркалирование (filter: '$FILTER_REGEX')..."
       jq_filter=".[\$v].release | to_entries[] | select(.key | test(\"$FILTER_REGEX\")) | .value.url + \"\t\" + .value.md5sum"
@@ -326,24 +698,24 @@ mirror_all() {
       echo "Зеркалирование (ВСЕ файлы)..."
   fi
 
-  jq -r --arg v "$APP_VERSION" "$jq_filter" "$CATALOG" | \
+  jq -r --arg v "$APP_VERSION" "$jq_filter" "$download_catalog" | \
   while IFS=$'\t' read -r url md5sum; do
     [[ -z "$url" || "$url" == "null" ]] && continue
-    
+
     # FIX: Разделяем объявление переменных, чтобы избежать unbound variable в set -u
     local rel_path
     rel_path="${url#*://*/}"
-    
+
     local dst
     dst="$root/$rel_path"
-    
+
     if [[ -f "$dst" ]]; then
       local local_md5; local_md5=$(md5sum "$dst" | awk '{print $1}')
       if [[ "$local_md5" == "$md5sum" ]]; then continue; fi
     fi
     queue_download "$url" "$dst"
   done
-  
+
   process_download_queue
   echo "Зеркалирование завершено."
 }
@@ -432,9 +804,27 @@ process_manual_sources() {
 }
 
 main() {
+  # Режим обновления каталога (только обновить и выйти)
+  if [[ $UPDATE_CATALOG -eq 1 && $MIRROR_ALL -eq 0 ]]; then
+    echo "🔄 Режим обновления каталога"
+    if ! is_root; then echo "⚠️ Требуются права root для обновления системного каталога." >&2; fi
+    update_catalog "$CATALOG_URL" "$CATALOG" "$REWRITE_CATALOG_HOST" "$CATALOG_BACKUP"
+    exit $?
+  fi
+
+  # Автообновление каталога перед основной логикой
+  if [[ $AUTO_UPDATE_CATALOG -eq 1 ]]; then
+    if ! check_catalog_age "$CATALOG" "$MAX_CATALOG_AGE"; then
+      echo "🔄 Автообновление каталога..."
+      update_catalog "$CATALOG_URL" "$CATALOG" "$REWRITE_CATALOG_HOST" "$CATALOG_BACKUP" || echo "⚠️ Не удалось обновить каталог, используется старый"
+    fi
+  fi
+
   if [[ $FROM_CATALOG -eq 1 || -n "$SRC_DIR" || ${#EXTRA_SOURCES[@]} -gt 0 || ${#SRC_URL_PAIRS[@]} -gt 0 ]]; then NEED_CONTROLLER=1; fi
   if [[ $NEED_CONTROLLER -eq 1 ]] && ! is_root; then echo "Требуются права root для режима контроллера." >&2; exit 1; fi
-  if { [[ $FROM_CATALOG -eq 1 ]] || [[ $MIRROR_ALL -eq 1 ]]; } && [[ -z "$APP_VERSION" || "$APP_VERSION" == "auto" ]]; then auto_detect_app_version; fi
+  # Для FROM_CATALOG вызываем auto_detect_app_version здесь
+  # Для MIRROR_ALL это делается внутри mirror_all() после установки каталога
+  if [[ $FROM_CATALOG -eq 1 ]] && [[ -z "$APP_VERSION" || "$APP_VERSION" == "auto" ]]; then auto_detect_app_version; fi
 
   if [[ $FROM_CATALOG -eq 1 ]]; then process_from_catalog; fi
   process_manual_sources
