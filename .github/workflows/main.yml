@@ -21,7 +21,12 @@ jobs:
           # Скачиваем актуальный каталог через API
           curl -s -o firmware_api.json "$FIRMWARE_CATALOG_URL"
           # Ищем информацию о прошивке для U7PG2
-          cat firmware_api.json | jq -e --arg dev "$DEVICE_CODE" '._embedded.firmware[] | select(.platform == $dev)' > firmware_info.json || echo "Прошивка для $DEVICE_CODE не найдена в каталоге" && exit 0
+          if cat firmware_api.json | jq -e --arg dev "$DEVICE_CODE" '._embedded.firmware[] | select(.platform == $dev)' > firmware_info.json; then
+            echo "Прошивка для $DEVICE_CODE найдена"
+          else
+            echo "Прошивка для $DEVICE_CODE не найдена в каталоге"
+            exit 0
+          fi
       - name: ⬇️ Скачать прошивку
         run: |
           # Извлекаем URL и версию
@@ -30,16 +35,30 @@ jobs:
           FW_FILENAME="U7PG2_${FW_VERSION}.bin"
           echo "Скачивание: $FW_VERSION"
           curl -s -L -o "$FW_FILENAME" "$FW_URL"
+          
+          # Проверяем размер файла
+          FILESIZE=$(stat -c%s "$FW_FILENAME")
+          echo "Размер файла: $FILESIZE байт"
+          
+          if [ "$FILESIZE" -lt 1000000 ]; then
+            echo "⚠️ Предупреждение: файл слишком мал ($FILESIZE байт), возможно ошибка скачивания"
+            exit 1
+          fi
+          
           echo "Скачано: $FW_FILENAME"
       - name: 📝 Создать Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: "${{ env.DEVICE_CODE }}-$(date +%Y-%m-%d)"
-          name: "UniFi U7PG2 Firmware $(date +%Y-%m-%d)"
+          tag_name: "U7PG2-${{ github.run_id }}"
+          name: "UniFi U7PG2 Firmware ${{ steps.date.outputs.formattedDate }}"
           body: |
             Автоматически загруженная прошивка для устройства U7PG2.
+            Версия прошивки: ${{ steps.firmware-info.outputs.version }}
+            Дата сборки: ${{ steps.date.outputs.formattedDate }}
             Ссылка на скачивание в релизе.
           files: "*.bin"
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: 🧹 Удалить временные файлы
