@@ -1,65 +1,222 @@
-name: Cache UniFi U7PG2 Firmware
+name: Cache UniFi Firmware
 on:
   schedule:
-    - cron: '0 0 * * 0'  # Запуск каждое воскресенье в полночь по UTC
-  workflow_dispatch:      # Позволяет запускать задачу вручную из интерфейса GitHub
+    - cron: '0 0 1 * *'  # 1-го числа каждого месяца
+  workflow_dispatch:
+    inputs:
+      devices:
+        description: 'Коды устройств через запятую'
+        required: false
+        default: 'U7PG2'
+
 jobs:
   cache-firmware:
     runs-on: ubuntu-latest
     env:
-      DEVICE_CODE: 'U7PG2'  # Целевой код устройства
       FIRMWARE_CATALOG_URL: 'https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-firmware&filter=eq~~channel~~release&limit=5000'
     steps:
       - name: 📥 Клонировать репозиторий
         uses: actions/checkout@v4
-      - name: ⚙️ Установить Python и зависимости
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
-      - name: 🔍 Получить каталог прошивок и найти U7PG2
-        run: |
-          # Скачиваем актуальный каталог через API
-          curl -s -o firmware_api.json "$FIRMWARE_CATALOG_URL"
-          # Ищем информацию о прошивке для U7PG2
-          if cat firmware_api.json | jq -e --arg dev "$DEVICE_CODE" '._embedded.firmware[] | select(.platform == $dev)' > firmware_info.json; then
-            echo "Прошивка для $DEVICE_CODE найдена"
-          else
-            echo "Прошивка для $DEVICE_CODE не найдена в каталоге"
-            exit 0
-          fi
-      - name: ⬇️ Скачать прошивку
-        run: |
-          # Извлекаем URL и версию
-          FW_URL=$(jq -r '._links.data.href' firmware_info.json)
-          FW_VERSION=$(jq -r '.version' firmware_info.json)
-          FW_FILENAME="U7PG2_${FW_VERSION}.bin"
-          echo "Скачивание: $FW_VERSION"
-          curl -s -L -o "$FW_FILENAME" "$FW_URL"
-          
-          # Проверяем размер файла
-          FILESIZE=$(stat -c%s "$FW_FILENAME")
-          echo "Размер файла: $FILESIZE байт"
-          
-          if [ "$FILESIZE" -lt 1000000 ]; then
-            echo "⚠️ Предупреждение: файл слишком мал ($FILESIZE байт), возможно ошибка скачивания"
-            exit 1
-          fi
-          
-          echo "Скачано: $FW_FILENAME"
-      - name: 📝 Создать Release
-        uses: softprops/action-gh-release@v1
         with:
-          tag_name: "U7PG2-${{ github.run_id }}"
-          name: "UniFi U7PG2 Firmware ${{ steps.date.outputs.formattedDate }}"
-          body: |
-            Автоматически загруженная прошивка для устройства U7PG2.
-            Версия прошивки: ${{ steps.firmware-info.outputs.version }}
-            Дата сборки: ${{ steps.date.outputs.formattedDate }}
-            Ссылка на скачивание в релизе.
-          files: "*.bin"
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: 🧹 Удалить временные файлы
-        run: rm -f firmware_api.json firmware_info.json *.bin
+          fetch-depth: 0  # Полная история для тегов
+      
+      - name: ⚙️ Установить зависимости
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: 🔍 Определить целевые устройства
+        id: set-devices
+        run: |
+          if [ -n "${{ github.event.inputs.devices }}" ]; then
+            DEVICES="${{ github.event.inputs.devices }}"
+          else
+            DEVICES="U7PG2"
+          fi
+          echo "devices=${DEVICES}" >> $GITHUB_OUTPUT
+          echo "devices_array=${DEVICES//,/ }" >> $GITHUB_ENV
+
+      - name: 📥 Получить каталог прошивок
+        run: curl -s -o firmware_api.json "$FIRMWARE_CATALOG_URL"
+
+      - name: 🔄 Найти и проверить обновления
+        id: check-updates
+        run: |
+          echo "## Сравнение версий:" > updates_info.md
+          UPDATES_FOUND=0
+          
+          # Получаем последний релиз с прошивками
+          LATEST_TAG=$(git describe --tags --match "firmware-*" --abbrev=0 2>/dev/null || echo "none")
+          
+          if [ "$LATEST_TAG" != "none" ]; then
+            echo "Последний релиз: $LATEST_TAG"
+            
+            # Получаем файлы из последнего релиза
+            git checkout $LATEST_TAG -- *.bin 2>/dev/null || true
+          fi
+          
+          for DEVICE in $devices_array; do
+            echo -e "\n=== Проверка $DEVICE ==="
+            
+            # Получаем информацию о новой прошивке
+            if jq -e --arg dev "$DEVICE" '._embedded.firmware[] | select(.platform == $dev)' firmware_api.json > "firmware_${DEVICE}.json" 2>/dev/null; then
+              NEW_VERSION=$(jq -r '.version' "firmware_${DEVICE}.json")
+              NEW_URL=$(jq -r '._links.data.href' "firmware_${DEVICE}.json")
+              
+              # Ищем текущую версию (если есть файлы)
+              CURRENT_FILE=$(ls ${DEVICE}_*.bin 2>/dev/null | head -1)
+              
+              if [ -f "$CURRENT_FILE" ]; then
+                # Извлекаем версию из имени файла
+                CURRENT_VERSION=$(echo "$CURRENT_FILE" | grep -oP "${DEVICE}_\K[^\.]+(?=\.bin)")
+                echo "Текущая: $CURRENT_VERSION"
+                echo "Новая:   $NEW_VERSION"
+                
+                if [ "$CURRENT_VERSION" != "$NEW_VERSION" ]; then
+                  echo "⚠️ НАЙДЕНО ОБНОВЛЕНИЕ!"
+                  echo "$DEVICE|$NEW_VERSION|$NEW_URL|update" >> devices_info.txt
+                  echo "- **$DEVICE**: $CURRENT_VERSION → $NEW_VERSION 🔄" >> updates_info.md
+                  UPDATES_FOUND=$((UPDATES_FOUND + 1))
+                else
+                  echo "✅ Версия актуальна"
+                  echo "$DEVICE|$NEW_VERSION|$NEW_URL|current" >> devices_info.txt
+                  echo "- $DEVICE: $CURRENT_VERSION (актуально)" >> updates_info.md
+                fi
+              else
+                # Файла нет, скачиваем первую версию
+                echo "⚠️ Файл не найден, будет скачана новая версия"
+                echo "$DEVICE|$NEW_VERSION|$NEW_URL|new" >> devices_info.txt
+                echo "- **$DEVICE**: новая прошивка $NEW_VERSION 📥" >> updates_info.md
+                UPDATES_FOUND=$((UPDATES_FOUND + 1))
+              fi
+            else
+              echo "❌ Прошивка для $DEVICE не найдена"
+            fi
+          done
+          
+          echo "updates_found=$UPDATES_FOUND" >> $GITHUB_OUTPUT
+          echo "Найдено обновлений: $UPDATES_FOUND"
+
+      - name: ⏩ Пропуск если нет обновлений
+        if: steps.check-updates.outputs.updates_found == '0'
+        run: |
+          echo "Обновлений не найдено, завершаем работу"
+          echo "### Отчет:" > report.md
+          cat updates_info.md >> report.md
+          echo "" >> report.md
+          echo "✅ Все прошивки актуальны!" >> report.md
+          cat report.md
+          exit 0
+
+      - name: ⬇️ Скачать новые прошивки
+        if: steps.check-updates.outputs.updates_found > '0'
+        run: |
+          echo "Скачиваем обновленные прошивки..."
+          
+          # Удаляем только старые версии тех устройств, которые обновляются
+          while IFS='|' read -r DEVICE VERSION URL STATUS; do
+            if [ "$STATUS" = "update" ] || [ "$STATUS" = "new" ]; then
+              # Удаляем старый файл этого устройства
+              rm -f ${DEVICE}_*.bin 2>/dev/null || true
+              
+              # Скачиваем новый
+              FW_FILENAME="${DEVICE}_${VERSION}.bin"
+              echo "Скачивание: $DEVICE $VERSION"
+              
+              curl -L -s -o "$FW_FILENAME" "$URL"
+              
+              if [ -f "$FW_FILENAME" ]; then
+                FILESIZE=$(stat -c%s "$FW_FILENAME")
+                if [ "$FILESIZE" -gt 1000000 ]; then
+                  echo "✅ $FW_FILENAME - $FILESIZE байт"
+                else
+                  echo "❌ Файл слишком мал, удаляем"
+                  rm -f "$FW_FILENAME"
+                fi
+              fi
+            fi
+          done < devices_info.txt
+          
+          # Сохраняем также актуальные прошивки
+          while IFS='|' read -r DEVICE VERSION URL STATUS; do
+            if [ "$STATUS" = "current" ]; then
+              # Ищем существующий файл
+              CURRENT_FILE=$(ls ${DEVICE}_*.bin 2>/dev/null | head -1)
+              if [ ! -f "$CURRENT_FILE" ]; then
+                echo "⚠️ Актуальный файл $DEVICE не найден, скачиваем..."
+                FW_FILENAME="${DEVICE}_${VERSION}.bin"
+                curl -L -s -o "$FW_FILENAME" "$URL"
+              fi
+            fi
+          done < devices_info.txt
+
+      - name: 🏷️ Удалить старый релиз если есть обновления
+        if: steps.check-updates.outputs.updates_found > '0'
+        run: |
+          # Получаем список релизов
+          API_URL="https://api.github.com/repos/${{ github.repository }}/releases"
+          releases=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$API_URL")
+          
+          # Находим последний релиз с прошивками
+          latest_release=$(echo "$releases" | jq -r '.[0] | select(.tag_name | startswith("firmware-")) | "\(.id)|\(.tag_name)"')
+          
+          if [ -n "$latest_release" ] && [ "$latest_release" != "null|null" ]; then
+            IFS='|' read -r release_id tag_name <<< "$latest_release"
+            echo "Удаление последнего релиза: $tag_name"
+            
+            # Удаляем релиз
+            curl -s -X DELETE \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$release_id"
+            
+            # Удаляем тег
+            curl -s -X DELETE \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$tag_name"
+          fi
+
+      - name: 📝 Создать новый релиз
+        if: steps.check-updates.outputs.updates_found > '0'
+        run: |
+          DATE=$(date +'%Y-%m-%d')
+          RELEASE_TAG="firmware-$DATE"
+          
+          # Создаем описание
+          echo "## UniFi Firmware - $DATE" > release_notes.md
+          echo "" >> release_notes.md
+          cat updates_info.md >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**Обновление:** 1 числа каждого месяца" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**Устройства:** ${{ steps.set-devices.outputs.devices }}" >> release_notes.md
+          
+          # Создаем релиз
+          release_response=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg tag "$RELEASE_TAG" \
+              --arg name "UniFi Firmware $DATE" \
+              --arg body "$(cat release_notes.md)" \
+              '{"tag_name":$tag,"name":$name,"body":$body,"draft":false,"prerelease":false}')" \
+            "https://api.github.com/repos/${{ github.repository }}/releases")
+          
+          upload_url=$(echo "$release_response" | jq -r '.upload_url // empty' | sed 's/{.*}//')
+          
+          if [ -n "$upload_url" ] && [ "$upload_url" != "null" ]; then
+            # Загружаем все .bin файлы
+            for bin_file in *.bin; do
+              if [ -f "$bin_file" ]; then
+                echo "Загрузка: $bin_file"
+                curl -s -X POST \
+                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Content-Type: application/octet-stream" \
+                  --data-binary @"$bin_file" \
+                  "$upload_url?name=$bin_file"
+              fi
+            done
+          fi
+
+      - name: 🧹 Очистка
+        if: always()
+        run: |
+          rm -f firmware_api.json firmware_*.json devices_info.txt updates_info.md release_notes.md report.md 2>/dev/null || true
+          git checkout main --force 2>/dev/null || true
