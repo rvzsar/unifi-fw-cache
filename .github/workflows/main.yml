@@ -1,217 +1,46 @@
-name: UniFi Firmware Mirror
-
+name: Cache UniFi U7PG2 Firmware
 on:
-  workflow_dispatch:
-    inputs:
-      models:
-        description: 'Models (space separated)'
-        default: 'U7PG2'
-        type: string
-      force_refresh:
-        description: 'Force re-download'
-        default: false
-        type: boolean
-
   schedule:
-    - cron: '0 3 * * 0'
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "mirror-${{ github.ref }}"
-  cancel-in-progress: true
-
+    - cron: '0 0 * * 0'  # Запуск каждое воскресенье в полночь по UTC
+  workflow_dispatch:      # Позволяет запускать задачу вручную из интерфейса GitHub
 jobs:
-  mirror:
+  cache-firmware:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    
+    env:
+      DEVICE_CODE: 'U7PG2'  # Целевой код устройства
+      FIRMWARE_CATALOG_URL: 'https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-firmware&filter=eq~~channel~~release&limit=5000'
     steps:
-      - uses: actions/checkout@v4
-
-      # --- CACHE: Не качаем то, что уже есть ---
-      - uses: actions/cache@v4
-        id: cache
-        with:
-          path: |
-            firmware/firmware/
-            firmware/firmware.json
-          key: fw-${{ hashFiles('scripts/unifi-fw-cache.sh') }}-${{ github.run_id }}
-          restore-keys: fw-${{ hashFiles('scripts/unifi-fw-cache.sh') }}-
-
-      # --- PHASE 1: Fetch Catalog ---
-      - name: Update Catalog
-        id: catalog
+      - name: 📥 Клонировать репозиторий
+        uses: actions/checkout@v4
+      - name: ⚙️ Установить Python и зависимости
         run: |
-          set -euo pipefail
-          mkdir -p firmware/firmware
-          
-          # Если скрипт умеет --fetch-catalog-api
-          if ./scripts/unifi-fw-cache.sh --help 2>&1 | grep -q fetch-catalog-api; then
-            ./scripts/unifi-fw-cache.sh \
-              --fetch-catalog-api \
-              --mirror-root ./firmware \
-              --no-restart
-          else
-            # Native fallback: API Ubiquiti
-            curl -sL \
-              -H "Accept: application/json" \
-              -A "Mozilla/5.0 (compatible; FirmwareBot/1.0)" \
-              "https://fw-download.ubnt.com/data/firmware.json" \
-              -o firmware/firmware.json
-          fi
-          
-          # Валидация
-          jq -e 'type == "object"' firmware/firmware.json || {
-            echo "::error::Invalid catalog JSON"
-            exit 1
-          }
-          
-          echo "count=$(jq 'keys | length' firmware/firmware.json)" >> $GITHUB_OUTPUT
-
-      # --- PHASE 2: Mirror Binaries ---
-      - name: Download Firmware
-        id: download
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+      - name: 🔍 Получить каталог прошивок и найти U7PG2
+        run: |
+          # Скачиваем актуальный каталог через API
+          curl -s -o firmware_api.json "$FIRMWARE_CATALOG_URL"
+          # Ищем информацию о прошивке для U7PG2
+          cat firmware_api.json | jq -e --arg dev "$DEVICE_CODE" '._embedded.firmware[] | select(.platform == $dev)' > firmware_info.json || echo "Прошивка для $DEVICE_CODE не найдена в каталоге" && exit 0
+      - name: ⬇️ Скачать прошивку
+        run: |
+          # Извлекаем URL и версию
+          FW_URL=$(jq -r '._links.data.href' firmware_info.json)
+          FW_VERSION=$(jq -r '.version' firmware_info.json)
+          FW_FILENAME="U7PG2_${FW_VERSION}.bin"
+          echo "Скачивание: $FW_VERSION"
+          curl -s -L -o "$FW_FILENAME" "$FW_URL"
+          echo "Скачано: $FW_FILENAME"
+      - name: 📝 Создать Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "${{ env.DEVICE_CODE }}-$(date +%Y-%m-%d)"
+          name: "UniFi U7PG2 Firmware $(date +%Y-%m-%d)"
+          body: |
+            Автоматически загруженная прошивка для устройства U7PG2.
+            Ссылка на скачивание в релизе.
+          files: "*.bin"
         env:
-          MODELS: ${{ github.event.inputs.models || 'U7PG2' }}
-          FORCE: ${{ github.event.inputs.force_refresh || 'false' }}
-          MIRROR_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/firmware"
-        run: |
-          set -euo pipefail
-          
-          FILTER=$(echo "$MODELS" | tr ' ' '|' | sed 's/^/^(/; s/$/)$/')
-          DOWNLOADED=0
-          SKIPPED=0
-          FAILED=0
-          
-          # Пробуем нативный скрипт первым
-          if ./scripts/unifi-fw-cache.sh --help 2>&1 | grep -q mirror-all; then
-            echo "Using unifi-fw-cache.sh..."
-            ./scripts/unifi-fw-cache.sh \
-              --mirror-all \
-              --mirror-root ./firmware \
-              --filter "$FILTER" \
-              --rewrite-catalog-host "$MIRROR_URL" \
-              ${FORCE == 'true' && echo '--no-cache' || echo '--skip-existing'}
-          else
-            # High-level manual mirror с parallel download
-            echo "Using built-in mirror logic..."
-            
-            for MODEL in $MODELS; do
-              echo "::group::Model: $MODEL"
-              
-              # Извлекаем URL'ы (рекурсивный поиск во всех вложенностях)
-              jq -r --arg m "$MODEL" '
-                .[$m] | 
-                .. | 
-                objects | 
-                select(.url? or .file_url?) | 
-                (.url // .file_url)
-              ' firmware/firmware.json 2>/dev/null | while read -r URL; do
-                [ -z "$URL" ] && continue
-                
-                FILE=$(basename "$URL" | cut -d'?' -f1)
-                DIR="firmware/firmware/$MODEL"
-                TARGET="$DIR/$FILE"
-                
-                mkdir -p "$DIR"
-                
-                if [ -f "$TARGET" ] && [ "$FORCE" != "true" ]; then
-                  echo "  ⏭️  $FILE (cached)"
-                  ((SKIPPED++)) || true
-                  continue
-                fi
-                
-                echo "  ⬇️  $FILE"
-                if wget -q --timeout=120 --tries=3 -O "$TARGET.tmp" "$URL"; then
-                  mv "$TARGET.tmp" "$TARGET"
-                  
-                  # Rewrite URL в каталоге
-                  sed -i "s|$URL|$MIRROR_URL/$MODEL/$FILE|g" firmware/firmware.json
-                  
-                  # Сохраняем хеш если был в JSON
-                  HASH=$(jq -r --arg u "$URL" '.. | objects | select(.url == $u or .file_url == $u) | .md5 // .sha256 // empty' firmware/firmware.json | head -1)
-                  [ -n "$HASH" ] && echo "$HASH  $FILE" > "$TARGET.md5"
-                  
-                  ((DOWNLOADED++)) || true
-                else
-                  echo "::warning::Failed: $URL"
-                  rm -f "$TARGET.tmp"
-                  ((FAILED++)) || true
-                fi
-              done
-              
-              echo "::endgroup::"
-            done
-          fi
-          
-          echo "downloaded=$DOWNLOADED" >> $GITHUB_OUTPUT
-          echo "skipped=$SKIPPED" >> $GITHUB_OUTPUT
-          echo "failed=$FAILED" >> $GITHUB_OUTPUT
-
-      # --- VALIDATION ---
-      - name: Verify & Index
-        run: |
-          # Проверяем чексуммы
-          find firmware/firmware -name "*.md5" | head -5 | while read -r f; do
-            cd "$(dirname "$f")" && md5sum -c "$(basename "$f")" 2>/dev/null || true
-            cd - >/dev/null
-          done
-          
-          # Генерируем index.html
-          cat > firmware/index.html << EOF
-          <!DOCTYPE html>
-          <html><head>
-            <meta charset="utf-8">
-            <title>UniFi Firmware Mirror</title>
-            <style>
-              body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}
-              table{width:100%;border-collapse:collapse}td,th{border:1px solid #ddd;padding:8px}
-              th{background:#f5f5f5}tr:hover{background:#f9f9f9}
-            </style>
-          </head><body>
-          <h1>🔧 UniFi Firmware Mirror</h1>
-          <p>Updated: $(date -u +"%Y-%m-%d %H:%M UTC") | Repo: ${{ github.repository }}</p>
-          <table>
-          <tr><th>Model</th><th>File</th><th>Size</th><th>Modified</th></tr>
-          EOF
-          
-          find firmware/firmware -type f ! -name "*.md5" ! -name "*.sha256" ! -name "*.json" -printf "%P\n" | \
-          while read -r line; do
-            MODEL=$(dirname "$line")
-            FILE=$(basename "$line")
-            SIZE=$(du -h "firmware/firmware/$line" | cut -f1)
-            DATE=$(stat -c "%y" "firmware/firmware/$line" | cut -d' ' -f1)
-            echo "<tr><td>$MODEL</td><td><a href=\"firmware/$line\">$FILE</a></td><td>$SIZE</td><td>$DATE</td></tr>" >> firmware/index.html
-          done
-          
-          echo "</table></body></html>" >> firmware/index.html
-
-      # --- DEPLOY (atomic) ---
-      - uses: actions/configure-pages@v5
-      
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: './firmware'
-          retention-days: 5
-      
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      # --- REPORT ---
-      - name: Summary
-        if: always()
-        run: |
-          echo "## 📊 Mirror Report" >> $GITHUB_STEP_SUMMARY
-          echo "- Models: ${{ github.event.inputs.models || 'U7PG2' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Catalog entries: ${{ steps.catalog.outputs.count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Downloaded: ${{ steps.download.outputs.downloaded || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Skipped (cached): ${{ steps.download.outputs.skipped || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Failed: ${{ steps.download.outputs.failed || '0' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/" >> $GITHUB_STEP_SUMMARY
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 🧹 Удалить временные файлы
+        run: rm -f firmware_api.json firmware_info.json *.bin
