@@ -1,0 +1,90 @@
+name: Update Firmware Mirror
+
+on:
+  schedule:
+    # Каждое воскресенье в 3:00 UTC (обновление раз в неделю)
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Модели для зеркала (через пробел)'
+        default: 'U7PG2'
+        required: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq wget coreutils
+      
+      - name: Setup git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Get catalog via API
+        run: |
+          chmod +x scripts/unifi-fw-cache.sh
+          ./scripts/unifi-fw-cache.sh \
+            --fetch-catalog-api \
+            --mirror-root ./firmware \
+            --no-restart
+      
+      - name: Download firmware for specific models
+        run: |
+          MODELS="${{ github.event.inputs.models || 'U7PG2' }}"
+          echo "Downloading models: $MODELS"
+          
+          # Скачиваем только нужные модели из каталога
+          for model in $MODELS; do
+            echo "Processing $model..."
+            ./scripts/unifi-fw-cache.sh \
+              --from-catalog \
+              --codes "$model" \
+              --catalog ./firmware/firmware.json \
+              --mirror-root ./firmware \
+              --rewrite-catalog-host "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/firmware" \
+              --no-restart
+          done
+      
+      - name: Check size
+        run: |
+          echo "Total size:"
+          du -sh ./firmware
+          echo "Files:"
+          find ./firmware -type f | head -20
+      
+      - name: Commit changes
+        run: |
+          git add firmware/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update firmware mirror: $(date -u +%Y-%m-%d)"
+            git push
+          fi
+      
+      # Публикация на GitHub Pages
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      
+      - name: Upload to Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './firmware'
+      
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
