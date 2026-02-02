@@ -47,17 +47,18 @@ jobs:
           MODELS="${{ github.event.inputs.models || 'U7PG2' }}"
           echo "Downloading models: $MODELS"
           
-          # Скачиваем только нужные модели из каталога
-          for model in $MODELS; do
-            echo "Processing $model..."
-            ./scripts/unifi-fw-cache.sh \
-              --from-catalog \
-              --codes "$model" \
-              --catalog ./firmware/firmware.json \
-              --mirror-root ./firmware \
-              --rewrite-catalog-host "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/firmware" \
-              --no-restart
-          done
+          # Преобразуем список моделей в regex: "U7PG2 UAP6MP" → "^(U7PG2|UAP6MP)$"
+          FILTER_REGEX="^($(echo "$MODELS" | tr ' ' '|'))$"
+          echo "Using filter: $FILTER_REGEX"
+          
+          # Используем --mirror-all вместо --from-catalog (не требует root)
+          ./scripts/unifi-fw-cache.sh \
+            --mirror-all \
+            --mirror-root ./firmware \
+            --filter "$FILTER_REGEX" \
+            --rewrite-catalog-host "${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/firmware" \
+            --no-restart
+
       
       - name: Check size
         run: |
