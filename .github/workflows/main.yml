@@ -13,7 +13,7 @@ jobs:
   cache-firmware:
     runs-on: ubuntu-latest
     env:
-      FIRMWARE_CATALOG_URL: 'https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-firmware&filter=eq~~channel~~release&limit=5000'
+      FIRMWARE_CATALOG_URL: 'https://fw-update.ubnt.com/api/firmware-latest?'
     steps:
       - name: 📥 Клонировать репозиторий
         uses: actions/checkout@v4
